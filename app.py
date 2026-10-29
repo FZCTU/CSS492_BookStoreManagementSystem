@@ -10,7 +10,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 app.secret_key = "bookstore-capstone-secret-cs492-2026"
 
-# Database file placed in current working directory
+# Database file in current directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
 DB_NAME = os.path.join(BASE_DIR, "bookstore.db")
 
@@ -27,11 +27,26 @@ def close_db(error):
     if db is not None:
         db.close()
 
+def log_audit(action, entity, entity_id=None, details=None):
+    """Audit logging helper for EP-10 Data Protection & Auditing."""
+    try:
+        db = get_db()
+        user_id = session.get("user_id")
+        user_email = session.get("email", "System/Anonymous")
+        db.execute("""
+            INSERT INTO audit_logs (user_id, user_email, action, entity, entity_id, details)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, user_email, action, entity, str(entity_id) if entity_id else None, details))
+        db.commit()
+    except Exception as e:
+        print(f"Audit log failed: {e}", flush=True)
+
 def init_db():
     db = sqlite3.connect(DB_NAME)
     cursor = db.cursor()
     cursor.execute("PRAGMA foreign_keys = ON")
 
+    # 1. Users table (EP-01)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,6 +58,7 @@ def init_db():
     )
     """)
 
+    # 2. Books table (EP-02, EP-03)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS books (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +76,7 @@ def init_db():
     )
     """)
 
+    # 3. Customer Orders & Items (EP-04, EP-05)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS customer_orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,6 +116,66 @@ def init_db():
     )
     """)
 
+    # 4. Suppliers table (EP-06)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS suppliers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        supplier_code TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        contact_person TEXT,
+        email TEXT,
+        phone TEXT,
+        address TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0, 1)),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    # 5. Purchase Orders & Line Items (EP-07, EP-08)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS purchase_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        po_number TEXT UNIQUE NOT NULL,
+        supplier_id INTEGER NOT NULL,
+        created_by INTEGER NOT NULL,
+        order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status TEXT NOT NULL CHECK(status IN ('Draft', 'Submitted', 'Partially Received', 'Received', 'Canceled')) DEFAULT 'Draft',
+        total_cost REAL NOT NULL DEFAULT 0.0,
+        notes TEXT,
+        FOREIGN KEY (supplier_id) REFERENCES suppliers(id),
+        FOREIGN KEY (created_by) REFERENCES users(id)
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS po_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        po_id INTEGER NOT NULL,
+        book_id INTEGER NOT NULL,
+        quantity_ordered INTEGER NOT NULL CHECK(quantity_ordered > 0),
+        quantity_received INTEGER NOT NULL DEFAULT 0 CHECK(quantity_received >= 0),
+        unit_cost REAL NOT NULL CHECK(unit_cost >= 0),
+        FOREIGN KEY (po_id) REFERENCES purchase_orders(id) ON DELETE CASCADE,
+        FOREIGN KEY (book_id) REFERENCES books(id)
+    )
+    """)
+
+    # 6. Audit Logs table (EP-10)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        user_email TEXT,
+        action TEXT NOT NULL,
+        entity TEXT NOT NULL,
+        entity_id TEXT,
+        details TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+    """)
+
+    # --- Pre-seed default data if empty ---
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         default_users = [
@@ -123,6 +200,19 @@ def init_db():
             INSERT INTO books (identifier, title, author, edition, category, condition, price, on_hand, reorder_level, location, is_active)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, sample_books)
+
+    cursor.execute("SELECT COUNT(*) FROM suppliers")
+    if cursor.fetchone()[0] == 0:
+        sample_suppliers = [
+            ("SUP-101", "Antiquarian Book Binderies & Press", "Arthur Pendelton", "orders@antiquarianbindery.com", "(555) 234-8901", "120 Heritage Way, Boston, MA", 1),
+            ("SUP-102", "Archival Folio Publishers", "Eleanor Vance", "supply@archivalfolio.com", "(555) 876-5432", "450 Preservation Blvd, Philadelphia, PA", 1),
+            ("SUP-103", "Heritage Manuscript Restorations", "Marcus Thorne", "contact@heritagems.com", "(555) 345-6789", "88 Old Print St, New York, NY", 1),
+            ("SUP-104", "Discontinued Classic Imports (Legacy)", "Walter Sterling", "info@legacyimports.com", "(555) 999-1122", "14 Harbor Rd, Portland, ME", 0)
+        ]
+        cursor.executemany("""
+            INSERT INTO suppliers (supplier_code, name, contact_person, email, phone, address, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, sample_suppliers)
 
     db.commit()
     db.close()
@@ -150,7 +240,7 @@ def role_required(allowed_roles):
         return decorated_function
     return decorator
 
-# --- ALL HTML TEMPLATES EMBEDDED DIRECTLY IN MEMORY ---
+# --- BASE LAYOUT ---
 BASE_LAYOUT = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -161,33 +251,49 @@ BASE_LAYOUT = """<!DOCTYPE html>
     <style>
         body { background-color: #f8f9fa; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
         .card { border-radius: 8px; border: 1px solid #dee2e6; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .badge-draft { background-color: #6c757d; }
+        .badge-submitted { background-color: #0d6efd; }
+        .badge-partially { background-color: #ffc107; color: #000; }
+        .badge-received { background-color: #198754; }
+        .badge-canceled { background-color: #dc3545; }
     </style>
 </head>
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
     <div class="container">
-        <a class="navbar-brand fw-bold" href="{{ url_for('catalog') }}">📚 Rare Bookstore</a>
-        <div class="navbar-nav me-auto">
-            <a class="nav-link" href="{{ url_for('catalog') }}">Catalog</a>
-            {% if session.get('role') in ['employee', 'admin'] %}
-                <a class="nav-link" href="{{ url_for('inventory') }}">Manage Inventory</a>
-                <a class="nav-link" href="{{ url_for('sales') }}">Sales History</a>
-            {% endif %}
-        </div>
-        <div class="navbar-nav ms-auto align-items-center">
-            <a class="btn btn-outline-light position-relative me-3" href="{{ url_for('view_cart') }}">
-                🛒 Cart
-                {% if session.get('cart') %}
-                    <span class="badge bg-danger ms-1">{{ session.get('cart')|length }}</span>
+        <a class="navbar-brand fw-bold" href="{{ url_for('catalog') }}">Rare Bookstore</a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navMenu">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="navMenu">
+            <div class="navbar-nav me-auto">
+                <a class="nav-link" href="{{ url_for('catalog') }}">Catalog</a>
+                {% if session.get('role') in ['employee', 'admin'] %}
+                    <a class="nav-link" href="{{ url_for('inventory') }}">Inventory</a>
+                    <a class="nav-link" href="{{ url_for('suppliers') }}">Suppliers</a>
+                    <a class="nav-link" href="{{ url_for('purchase_orders') }}">Purchase Orders</a>
+                    <a class="nav-link" href="{{ url_for('sales') }}">Sales</a>
+                    <a class="nav-link" href="{{ url_for('reports') }}">Reports</a>
                 {% endif %}
-            </a>
-            {% if session.get('user_id') %}
-                <span class="text-light me-2">👤 {{ session.get('name') }} <span class="badge bg-secondary">{{ session.get('role')|title }}</span></span>
-                <a class="btn btn-outline-danger btn-sm" href="{{ url_for('logout') }}">Sign Out</a>
-            {% else %}
-                <a class="nav-link text-light" href="{{ url_for('login') }}">Sign In</a>
-                <a class="btn btn-primary btn-sm ms-2" href="{{ url_for('register') }}">Register</a>
-            {% endif %}
+                {% if session.get('role') == 'admin' %}
+                    <a class="nav-link text-warning" href="{{ url_for('audit_logs_view') }}">Audit Logs</a>
+                {% endif %}
+            </div>
+            <div class="navbar-nav ms-auto align-items-center">
+                <a class="btn btn-outline-light position-relative me-3" href="{{ url_for('view_cart') }}">
+                    Cart
+                    {% if session.get('cart') %}
+                        <span class="badge bg-danger ms-1">{{ session.get('cart')|length }}</span>
+                    {% endif %}
+                </a>
+                {% if session.get('user_id') %}
+                    <span class="text-light me-2">{{ session.get('name') }} <span class="badge bg-secondary">{{ session.get('role')|title }}</span></span>
+                    <a class="btn btn-outline-danger btn-sm" href="{{ url_for('logout') }}">Sign Out</a>
+                {% else %}
+                    <a class="nav-link text-light" href="{{ url_for('login') }}">Sign In</a>
+                    <a class="btn btn-primary btn-sm ms-2" href="{{ url_for('register') }}">Register</a>
+                {% endif %}
+            </div>
         </div>
     </div>
 </nav>
@@ -212,8 +318,7 @@ def render_page(inner_content, **kwargs):
     rendered_body = render_template_string(inner_content, **kwargs)
     return render_template_string(BASE_LAYOUT, body_content=rendered_body, **kwargs)
 
-# --- ROUTES ---
-
+# --- SPRINT 1 CORE ROUTES ---
 @app.route("/")
 def index():
     return redirect(url_for("catalog"))
@@ -230,9 +335,10 @@ def register():
         else:
             db = get_db()
             try:
-                db.execute("INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, 'customer')",
+                cur = db.execute("INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, 'customer')",
                            (name, email, generate_password_hash(password)))
                 db.commit()
+                log_audit("REGISTER_USER", "users", cur.lastrowid, f"Registered new customer account: {email}")
                 flash("Registration successful! Please sign in.", "success")
                 return redirect(url_for("login"))
             except sqlite3.IntegrityError:
@@ -282,6 +388,7 @@ def login():
             session["name"] = user["name"]
             session["email"] = user["email"]
             session["role"] = user["role"]
+            log_audit("LOGIN_SUCCESS", "users", user["id"], f"User signed in: {user['email']} ({user['role']})")
             flash(f"Welcome back, {user['name']}! Signed in as {user['role'].title()}.", "success")
             return redirect(url_for("catalog"))
         else:
@@ -308,9 +415,9 @@ def login():
                 </div>
                 <div class="mt-4 p-3 bg-light rounded small border">
                     <strong>Pre-Seeded Test Credentials:</strong><br>
-                    • <em>Admin:</em> admin@bookstore.com / Admin123!<br>
-                    • <em>Staff:</em> employee@bookstore.com / Employee123!<br>
-                    • <em>Customer:</em> customer@bookstore.com / Customer123!
+                    • Admin: admin@bookstore.com / Admin123!<br>
+                    • Staff: employee@bookstore.com / Employee123!<br>
+                    • Customer: customer@bookstore.com / Customer123!
                 </div>
             </div>
         </div>
@@ -320,6 +427,9 @@ def login():
 
 @app.route("/logout")
 def logout():
+    uid = session.get("user_id")
+    if uid:
+        log_audit("LOGOUT", "users", uid, f"User signed out: {session.get('email')}")
     session.clear()
     flash("You have been signed out.", "info")
     return redirect(url_for("login"))
@@ -475,7 +585,12 @@ def inventory():
                     <td><strong>{{ b.title }}</strong><br><small class="text-muted">{{ b.author }} ({{ b.condition }})</small></td>
                     <td><span class="badge bg-secondary">{{ b.category }}</span></td>
                     <td>${{ "%.2f"|format(b.price) }}</td>
-                    <td>{{ b.on_hand }} (Reorder: {{ b.reorder_level }})</td>
+                    <td>
+                        {{ b.on_hand }}
+                        {% if b.on_hand <= b.reorder_level %}
+                            <span class="badge bg-warning text-dark ms-1">Low (≤{{ b.reorder_level }})</span>
+                        {% endif %}
+                    </td>
                     <td>{{ b.location or 'N/A' }}</td>
                     <td>{% if b.is_active %}<span class="badge bg-success">Active</span>{% else %}<span class="badge bg-dark">Inactive</span>{% endif %}</td>
                     <td>
@@ -516,11 +631,12 @@ def add_book():
         else:
             db = get_db()
             try:
-                db.execute("""
+                cur = db.execute("""
                     INSERT INTO books (identifier, title, author, edition, category, condition, price, on_hand, reorder_level, location, is_active)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """, (identifier, title, author, edition, category, condition, price, on_hand, reorder_level, location))
                 db.commit()
+                log_audit("ADD_BOOK", "books", cur.lastrowid, f"Added book SKU: {identifier} - '{title}'")
                 flash("Book added to inventory successfully!", "success")
                 return redirect(url_for("inventory"))
             except sqlite3.IntegrityError:
@@ -622,6 +738,7 @@ def edit_book(book_id):
             WHERE id = ?
         """, (title, author, edition, category, condition, price, on_hand, reorder_level, location, is_active, book_id))
         db.commit()
+        log_audit("UPDATE_BOOK", "books", book_id, f"Updated book {book['identifier']} - '{title}'")
         flash("Book record updated successfully.", "success")
         return redirect(url_for("inventory"))
 
@@ -698,11 +815,12 @@ def edit_book(book_id):
 @role_required(["employee", "admin"])
 def toggle_book(book_id):
     db = get_db()
-    book = db.execute("SELECT is_active FROM books WHERE id = ?", (book_id,)).fetchone()
+    book = db.execute("SELECT is_active, identifier, title FROM books WHERE id = ?", (book_id,)).fetchone()
     if book:
         new_status = 0 if book["is_active"] == 1 else 1
         db.execute("UPDATE books SET is_active = ? WHERE id = ?", (new_status, book_id))
         db.commit()
+        log_audit("TOGGLE_BOOK_STATUS", "books", book_id, f"Changed active status to {new_status} for SKU: {book['identifier']}")
         flash("Book active status toggled.", "info")
     return redirect(url_for("inventory"))
 
@@ -754,7 +872,7 @@ def view_cart():
                     </tbody>
                 </table>
             </div>
-            <a href="{{ url_for('catalog') }}" class="btn btn-outline-secondary">← Continue Shopping</a>
+            <a href="{{ url_for('catalog') }}" class="btn btn-outline-secondary">Back to Catalog</a>
         </div>
         <div class="col-md-4">
             <div class="card p-3">
@@ -867,6 +985,7 @@ def checkout():
 
         db.commit()
         session.pop("cart", None)
+        log_audit("CHECKOUT_COMPLETE", "customer_orders", order_id, f"Order {order_num} completed. Total: ${total:.2f}")
         flash("Order placed successfully!", "success")
         return redirect(url_for("view_receipt", order_id=order_id))
 
@@ -908,7 +1027,7 @@ def view_receipt(order_id):
             <div class="card p-4 bg-white">
                 <div class="d-flex justify-content-between border-bottom pb-3 mb-3">
                     <div>
-                        <h3 class="fw-bold mb-0">📚 Rare Bookstore Inc.</h3>
+                        <h3 class="fw-bold mb-0">Rare Bookstore Inc.</h3>
                         <small class="text-muted">Centralized Bookstore Prototype</small>
                     </div>
                     <div class="text-end">
@@ -954,8 +1073,8 @@ def view_receipt(order_id):
                     </tfoot>
                 </table>
                 <div class="d-flex justify-content-between pt-3 border-top">
-                    <a href="{{ url_for('catalog') }}" class="btn btn-outline-secondary">← Back to Catalog</a>
-                    <button onclick="window.print()" class="btn btn-primary">🖨️ Print Receipt</button>
+                    <a href="{{ url_for('catalog') }}" class="btn btn-outline-secondary">Back to Catalog</a>
+                    <button onclick="window.print()" class="btn btn-primary">Print Receipt</button>
                 </div>
             </div>
         </div>
@@ -1013,14 +1132,893 @@ def sales():
     """
     return render_page(CONTENT, sales=sales_list)
 
+# --- SPRINT 2 MODULES ---
+
+# --- EP-06: SUPPLIER MANAGEMENT ---
+@app.route("/suppliers")
+@role_required(["employee", "admin"])
+def suppliers():
+    db = get_db()
+    suppliers_list = db.execute("SELECT * FROM suppliers ORDER BY is_active DESC, name ASC").fetchall()
+    CONTENT = """
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2 class="fw-bold mb-0">Supplier & Vendor Directory (EP-06)</h2>
+            <p class="text-muted mb-0">Manage publishing houses, antiquarian binderies, and archival suppliers.</p>
+        </div>
+        <a href="{{ url_for('add_supplier') }}" class="btn btn-success">+ Add New Supplier</a>
+    </div>
+    <div class="card p-3">
+        <table class="table table-hover align-middle mb-0">
+            <thead class="table-light">
+                <tr>
+                    <th>Code</th>
+                    <th>Vendor Name</th>
+                    <th>Contact Person</th>
+                    <th>Email & Phone</th>
+                    <th>Address</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for s in suppliers %}
+                <tr class="{% if not s.is_active %}table-secondary opacity-75{% endif %}">
+                    <td><code>{{ s.supplier_code }}</code></td>
+                    <td><strong>{{ s.name }}</strong></td>
+                    <td>{{ s.contact_person or 'N/A' }}</td>
+                    <td>
+                        <small>{{ s.email or 'No email' }}</small><br>
+                        <small class="text-muted">{{ s.phone or 'No phone' }}</small>
+                    </td>
+                    <td><small>{{ s.address or 'N/A' }}</small></td>
+                    <td>
+                        {% if s.is_active %}
+                            <span class="badge bg-success">Active</span>
+                        {% else %}
+                            <span class="badge bg-dark">Inactive (Archived)</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <div class="btn-group btn-group-sm">
+                            <a href="{{ url_for('edit_supplier', supplier_id=s.id) }}" class="btn btn-outline-primary">Edit</a>
+                            <form method="POST" action="{{ url_for('toggle_supplier', supplier_id=s.id) }}" class="d-inline">
+                                <button type="submit" class="btn btn-outline-warning">
+                                    {% if s.is_active %}Deactivate{% else %}Reactivate{% endif %}
+                                </button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    """
+    return render_page(CONTENT, suppliers=suppliers_list)
+
+@app.route("/suppliers/add", methods=["GET", "POST"])
+@role_required(["employee", "admin"])
+def add_supplier():
+    if request.method == "POST":
+        code = request.form.get("supplier_code", "").strip().upper()
+        name = request.form.get("name", "").strip()
+        contact = request.form.get("contact_person", "").strip()
+        email = request.form.get("email", "").strip()
+        phone = request.form.get("phone", "").strip()
+        address = request.form.get("address", "").strip()
+
+        if not code or not name:
+            flash("Supplier Code and Company Name are required.", "danger")
+        else:
+            db = get_db()
+            try:
+                cur = db.execute("""
+                    INSERT INTO suppliers (supplier_code, name, contact_person, email, phone, address, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, 1)
+                """, (code, name, contact, email, phone, address))
+                db.commit()
+                log_audit("ADD_SUPPLIER", "suppliers", cur.lastrowid, f"Added supplier {code} - {name}")
+                flash("Supplier created successfully!", "success")
+                return redirect(url_for("suppliers"))
+            except sqlite3.IntegrityError:
+                flash(f"Supplier code '{code}' already exists.", "danger")
+
+    CONTENT = """
+    <div class="row justify-content-center">
+        <div class="col-md-7">
+            <div class="card p-4">
+                <h3 class="fw-bold mb-3">Add Supplier / Publisher</h3>
+                <form method="POST">
+                    <div class="row">
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Supplier Code</label>
+                            <input type="text" name="supplier_code" class="form-control" placeholder="SUP-105" required autofocus>
+                        </div>
+                        <div class="col-md-8 mb-3">
+                            <label class="form-label">Company Name</label>
+                            <input type="text" name="name" class="form-control" placeholder="Oxford Archival Editions" required>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Primary Contact Person</label>
+                        <input type="text" name="contact_person" class="form-control" placeholder="Full Name">
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Email</label>
+                            <input type="email" name="email" class="form-control" placeholder="orders@company.com">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Phone</label>
+                            <input type="text" name="phone" class="form-control" placeholder="(555) 000-0000">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Mailing Address</label>
+                        <textarea name="address" class="form-control" rows="2" placeholder="Street, City, State, ZIP"></textarea>
+                    </div>
+                    <div class="d-flex justify-content-between">
+                        <a href="{{ url_for('suppliers') }}" class="btn btn-secondary">Cancel</a>
+                        <button type="submit" class="btn btn-primary">Save Supplier</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    """
+    return render_page(CONTENT)
+
+@app.route("/suppliers/edit/<int:supplier_id>", methods=["GET", "POST"])
+@role_required(["employee", "admin"])
+def edit_supplier(supplier_id):
+    db = get_db()
+    supplier = db.execute("SELECT * FROM suppliers WHERE id = ?", (supplier_id,)).fetchone()
+    if not supplier:
+        flash("Supplier not found.", "danger")
+        return redirect(url_for("suppliers"))
+
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        contact = request.form.get("contact_person", "").strip()
+        email = request.form.get("email", "").strip()
+        phone = request.form.get("phone", "").strip()
+        address = request.form.get("address", "").strip()
+        is_active = 1 if request.form.get("is_active") == "1" else 0
+
+        db.execute("""
+            UPDATE suppliers
+            SET name = ?, contact_person = ?, email = ?, phone = ?, address = ?, is_active = ?
+            WHERE id = ?
+        """, (name, contact, email, phone, address, is_active, supplier_id))
+        db.commit()
+        log_audit("UPDATE_SUPPLIER", "suppliers", supplier_id, f"Updated supplier {supplier['supplier_code']} - {name}")
+        flash("Supplier updated successfully.", "success")
+        return redirect(url_for("suppliers"))
+
+    CONTENT = """
+    <div class="row justify-content-center">
+        <div class="col-md-7">
+            <div class="card p-4">
+                <h3 class="fw-bold mb-3">Edit Supplier: {{ supplier.name }}</h3>
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Supplier Code (Immutable)</label>
+                        <input type="text" class="form-control bg-light" value="{{ supplier.supplier_code }}" readonly>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Company Name</label>
+                        <input type="text" name="name" class="form-control" value="{{ supplier.name }}" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Contact Person</label>
+                        <input type="text" name="contact_person" class="form-control" value="{{ supplier.contact_person or '' }}">
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Email</label>
+                            <input type="email" name="email" class="form-control" value="{{ supplier.email or '' }}">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Phone</label>
+                            <input type="text" name="phone" class="form-control" value="{{ supplier.phone or '' }}">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Address</label>
+                        <textarea name="address" class="form-control" rows="2">{{ supplier.address or '' }}</textarea>
+                    </div>
+                    <div class="mb-3 form-check">
+                        <input type="checkbox" class="form-check-input" name="is_active" value="1" id="act" {% if supplier.is_active %}checked{% endif %}>
+                        <label class="form-check-label" for="act">Active Supplier (Eligible for new Purchase Orders)</label>
+                    </div>
+                    <div class="d-flex justify-content-between">
+                        <a href="{{ url_for('suppliers') }}" class="btn btn-secondary">Cancel</a>
+                        <button type="submit" class="btn btn-primary">Update Supplier</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    """
+    return render_page(CONTENT, supplier=supplier)
+
+@app.route("/suppliers/toggle/<int:supplier_id>", methods=["POST"])
+@role_required(["employee", "admin"])
+def toggle_supplier(supplier_id):
+    db = get_db()
+    supplier = db.execute("SELECT is_active, supplier_code, name FROM suppliers WHERE id = ?", (supplier_id,)).fetchone()
+    if supplier:
+        new_status = 0 if supplier["is_active"] == 1 else 1
+        db.execute("UPDATE suppliers SET is_active = ? WHERE id = ?", (new_status, supplier_id))
+        db.commit()
+        log_audit("TOGGLE_SUPPLIER_STATUS", "suppliers", supplier_id, f"Changed status to {new_status} for {supplier['supplier_code']}")
+        flash(f"Supplier '{supplier['name']}' status updated.", "info")
+    return redirect(url_for("suppliers"))
+
+# --- EP-07 & EP-08: PURCHASE ORDERS & RECEIVING ---
+@app.route("/purchase_orders")
+@role_required(["employee", "admin"])
+def purchase_orders():
+    db = get_db()
+    pos = db.execute("""
+        SELECT po.*, s.name as supplier_name, s.supplier_code, u.name as creator_name,
+               (SELECT COUNT(*) FROM po_items WHERE po_id = po.id) as item_count,
+               (SELECT SUM(quantity_ordered) FROM po_items WHERE po_id = po.id) as total_qty_ordered,
+               (SELECT SUM(quantity_received) FROM po_items WHERE po_id = po.id) as total_qty_received
+        FROM purchase_orders po
+        JOIN suppliers s ON po.supplier_id = s.id
+        JOIN users u ON po.created_by = u.id
+        ORDER BY po.id DESC
+    """).fetchall()
+
+    CONTENT = """
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2 class="fw-bold mb-0">Purchase Orders & Replenishment (EP-07)</h2>
+            <p class="text-muted mb-0">Track supplier procurement, manage workflow stages, and reconcile deliveries.</p>
+        </div>
+        <a href="{{ url_for('create_purchase_order') }}" class="btn btn-primary">+ Create New Purchase Order</a>
+    </div>
+    <div class="card p-3">
+        <table class="table table-hover align-middle mb-0">
+            <thead class="table-light">
+                <tr>
+                    <th>PO Number</th>
+                    <th>Supplier</th>
+                    <th>Order Date</th>
+                    <th>Items / Qty</th>
+                    <th>Total Cost</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for p in pos %}
+                <tr>
+                    <td><code>{{ p.po_number }}</code></td>
+                    <td><strong>{{ p.supplier_name }}</strong><br><small class="text-muted">{{ p.supplier_code }}</small></td>
+                    <td><small>{{ p.order_date }}</small></td>
+                    <td>{{ p.total_qty_received or 0 }} / {{ p.total_qty_ordered or 0 }} units</td>
+                    <td class="fw-bold">${{ "%.2f"|format(p.total_cost) }}</td>
+                    <td>
+                        {% if p.status == 'Draft' %}
+                            <span class="badge badge-draft">Draft</span>
+                        {% elif p.status == 'Submitted' %}
+                            <span class="badge badge-submitted">Submitted</span>
+                        {% elif p.status == 'Partially Received' %}
+                            <span class="badge badge-partially">Partially Received</span>
+                        {% elif p.status == 'Received' %}
+                            <span class="badge badge-received">Fully Received</span>
+                        {% else %}
+                            <span class="badge badge-canceled">Canceled</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <div class="btn-group btn-group-sm">
+                            <a href="{{ url_for('view_purchase_order', po_id=p.id) }}" class="btn btn-outline-secondary">View</a>
+                            {% if p.status in ['Submitted', 'Partially Received'] %}
+                                <a href="{{ url_for('receive_purchase_order', po_id=p.id) }}" class="btn btn-success">Receive Stock</a>
+                            {% endif %}
+                        </div>
+                    </td>
+                </tr>
+                {% else %}
+                <tr><td colspan="7" class="text-center py-4 text-muted">No purchase orders found. Create your first PO above.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    """
+    return render_page(CONTENT, pos=pos)
+
+@app.route("/purchase_orders/create", methods=["GET", "POST"])
+@role_required(["employee", "admin"])
+def create_purchase_order():
+    db = get_db()
+    suppliers_list = db.execute("SELECT * FROM suppliers WHERE is_active = 1 ORDER BY name ASC").fetchall()
+    books_list = db.execute("SELECT * FROM books WHERE is_active = 1 ORDER BY title ASC").fetchall()
+
+    if request.method == "POST":
+        supplier_id = request.form.get("supplier_id")
+        notes = request.form.get("notes", "").strip()
+
+        # Parse dynamic item lines
+        book_ids = request.form.getlist("book_id[]")
+        quantities = request.form.getlist("quantity[]")
+        costs = request.form.getlist("cost[]")
+
+        if not supplier_id or not book_ids:
+            flash("Please select a supplier and add at least one line item.", "danger")
+        else:
+            try:
+                cursor = db.cursor()
+                cursor.execute("BEGIN TRANSACTION")
+
+                po_number = f"PO-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                total_po_cost = 0.0
+                items_to_insert = []
+
+                for b_id, q_val, c_val in zip(book_ids, quantities, costs):
+                    b_id = int(b_id)
+                    qty = int(q_val)
+                    cost = float(c_val)
+                    if qty <= 0 or cost < 0:
+                        raise ValueError("Quantity must be positive and cost cannot be negative.")
+                    line_cost = qty * cost
+                    total_po_cost += line_cost
+                    items_to_insert.append((b_id, qty, cost))
+
+                cursor.execute("""
+                    INSERT INTO purchase_orders (po_number, supplier_id, created_by, status, total_cost, notes)
+                    VALUES (?, ?, ?, 'Draft', ?, ?)
+                """, (po_number, int(supplier_id), session["user_id"], total_po_cost, notes))
+                po_id = cursor.lastrowid
+
+                for b_id, qty, cost in items_to_insert:
+                    cursor.execute("""
+                        INSERT INTO po_items (po_id, book_id, quantity_ordered, quantity_received, unit_cost)
+                        VALUES (?, ?, ?, 0, ?)
+                    """, (po_id, b_id, qty, cost))
+
+                db.commit()
+                log_audit("CREATE_PURCHASE_ORDER", "purchase_orders", po_id, f"Created PO {po_number} - Total Cost: ${total_po_cost:.2f}")
+                flash(f"Purchase order {po_number} created as Draft.", "success")
+                return redirect(url_for("view_purchase_order", po_id=po_id))
+            except Exception as e:
+                db.rollback()
+                flash(f"Error creating PO: {str(e)}", "danger")
+
+    CONTENT = """
+    <div class="row justify-content-center">
+        <div class="col-md-9">
+            <div class="card p-4">
+                <h3 class="fw-bold mb-3">Create Purchase Order (EP-07)</h3>
+                <form method="POST">
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Select Active Supplier</label>
+                            <select name="supplier_id" class="form-select" required>
+                                <option value="">-- Choose Vendor --</option>
+                                {% for s in suppliers %}
+                                    <option value="{{ s.id }}">{{ s.name }} ({{ s.supplier_code }})</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Internal Notes / Instructions</label>
+                            <input type="text" name="notes" class="form-control" placeholder="Special edition batch, expected delivery timeline...">
+                        </div>
+                    </div>
+
+                    <h5 class="fw-bold mt-4 border-bottom pb-2">Line Items (Books to Restock)</h5>
+                    <div id="itemsContainer">
+                        <div class="row g-2 mb-2 item-row">
+                            <div class="col-md-5">
+                                <select name="book_id[]" class="form-select" required>
+                                    <option value="">-- Select Title --</option>
+                                    {% for b in books %}
+                                        <option value="{{ b.id }}">{{ b.title }} (Current Stock: {{ b.on_hand }})</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <input type="number" name="quantity[]" class="form-control" placeholder="Qty" min="1" value="5" required>
+                            </div>
+                            <div class="col-md-3">
+                                <input type="number" step="0.01" name="cost[]" class="form-control" placeholder="Wholesale Cost ($)" min="0" value="25.00" required>
+                            </div>
+                            <div class="col-md-1">
+                                <button type="button" class="btn btn-outline-danger w-100" onclick="removeRow(this)">X</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <button type="button" class="btn btn-outline-secondary btn-sm mt-2 mb-4" onclick="addRow()">+ Add Another Line Item</button>
+
+                    <div class="d-flex justify-content-between border-top pt-3">
+                        <a href="{{ url_for('purchase_orders') }}" class="btn btn-secondary">Cancel</a>
+                        <button type="submit" class="btn btn-primary">Save as Draft Purchase Order</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    function addRow() {
+        const container = document.getElementById('itemsContainer');
+        const firstRow = container.querySelector('.item-row');
+        const newRow = firstRow.cloneNode(true);
+        newRow.querySelector('select').selectedIndex = 0;
+        container.appendChild(newRow);
+    }
+    function removeRow(btn) {
+        const rows = document.querySelectorAll('.item-row');
+        if (rows.length > 1) {
+            btn.closest('.item-row').remove();
+        }
+    }
+    </script>
+    """
+    return render_page(CONTENT, suppliers=suppliers_list, books=books_list)
+
+@app.route("/purchase_orders/view/<int:po_id>")
+@role_required(["employee", "admin"])
+def view_purchase_order(po_id):
+    db = get_db()
+    po = db.execute("""
+        SELECT po.*, s.name as supplier_name, s.supplier_code, s.email as supplier_email,
+               s.phone as supplier_phone, s.address as supplier_address, u.name as creator_name
+        FROM purchase_orders po
+        JOIN suppliers s ON po.supplier_id = s.id
+        JOIN users u ON po.created_by = u.id
+        WHERE po.id = ?
+    """, (po_id,)).fetchone()
+
+    if not po:
+        flash("Purchase order not found.", "danger")
+        return redirect(url_for("purchase_orders"))
+
+    items = db.execute("""
+        SELECT poi.*, b.title, b.identifier, b.author, b.on_hand
+        FROM po_items poi
+        JOIN books b ON poi.book_id = b.id
+        WHERE poi.po_id = ?
+    """, (po_id,)).fetchall()
+
+    CONTENT = """
+    <div class="row justify-content-center">
+        <div class="col-md-9">
+            <div class="card p-4 bg-white">
+                <div class="d-flex justify-content-between border-bottom pb-3 mb-3">
+                    <div>
+                        <h3 class="fw-bold mb-0">Rare Bookstore Inc.</h3>
+                        <small class="text-muted">Procurement & Replenishment Department</small>
+                    </div>
+                    <div class="text-end">
+                        <h4 class="mb-0"><code>{{ po.po_number }}</code></h4>
+                        <span class="badge {% if po.status == 'Received' %}bg-success{% elif po.status == 'Submitted' %}bg-primary{% elif po.status == 'Partially Received' %}bg-warning text-dark{% elif po.status == 'Draft' %}bg-secondary{% else %}bg-danger{% endif %}">
+                            {{ po.status }}
+                        </span>
+                    </div>
+                </div>
+
+                <div class="row mb-4">
+                    <div class="col-6">
+                        <h6 class="fw-bold text-muted">Vendor</h6>
+                        <p class="mb-0"><strong>{{ po.supplier_name }}</strong> ({{ po.supplier_code }})</p>
+                        <p class="mb-0 small text-muted">{{ po.supplier_email }} | {{ po.supplier_phone }}</p>
+                        <p class="mb-0 small text-muted">{{ po.supplier_address }}</p>
+                    </div>
+                    <div class="col-6 text-end">
+                        <h6 class="fw-bold text-muted">Order Details</h6>
+                        <p class="mb-0 small"><strong>Created By:</strong> {{ po.creator_name }}</p>
+                        <p class="mb-0 small"><strong>Date:</strong> {{ po.order_date }}</p>
+                        <p class="mb-0 small"><strong>Notes:</strong> {{ po.notes or 'None' }}</p>
+                    </div>
+                </div>
+
+                <table class="table table-bordered mb-4">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Book Title & SKU</th>
+                            <th class="text-center">Ordered</th>
+                            <th class="text-center">Received</th>
+                            <th class="text-end">Unit Cost</th>
+                            <th class="text-end">Total Line</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for item in items %}
+                        <tr>
+                            <td><strong>{{ item.title }}</strong><br><small class="text-muted">SKU: {{ item.identifier }}</small></td>
+                            <td class="text-center">{{ item.quantity_ordered }}</td>
+                            <td class="text-center">
+                                <span class="{% if item.quantity_received >= item.quantity_ordered %}text-success fw-bold{% elif item.quantity_received > 0 %}text-warning fw-bold{% endif %}">
+                                    {{ item.quantity_received }}
+                                </span>
+                            </td>
+                            <td class="text-end">${{ "%.2f"|format(item.unit_cost) }}</td>
+                            <td class="text-end">${{ "%.2f"|format(item.unit_cost * item.quantity_ordered) }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                    <tfoot>
+                        <tr class="table-light fs-5">
+                            <td colspan="4" class="text-end fw-bold">Total Estimated Cost:</td>
+                            <td class="text-end fw-bold text-primary">${{ "%.2f"|format(po.total_cost) }}</td>
+                        </tr>
+                    </tfoot>
+                </table>
+
+                <div class="d-flex justify-content-between pt-3 border-top">
+                    <a href="{{ url_for('purchase_orders') }}" class="btn btn-outline-secondary">Back to PO List</a>
+                    <div class="btn-group">
+                        <button onclick="window.print()" class="btn btn-outline-dark">Print PO</button>
+                        {% if po.status == 'Draft' %}
+                            <form method="POST" action="{{ url_for('change_po_status', po_id=po.id, new_status='Submitted') }}" class="d-inline ms-2">
+                                <button type="submit" class="btn btn-primary">Submit to Supplier</button>
+                            </form>
+                            <form method="POST" action="{{ url_for('change_po_status', po_id=po.id, new_status='Canceled') }}" class="d-inline ms-2">
+                                <button type="submit" class="btn btn-outline-danger">Cancel PO</button>
+                            </form>
+                        {% elif po.status in ['Submitted', 'Partially Received'] %}
+                            <a href="{{ url_for('receive_purchase_order', po_id=po.id) }}" class="btn btn-success ms-2">Receive Shipment</a>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    """
+    return render_page(CONTENT, po=po, items=items)
+
+@app.route("/purchase_orders/status/<int:po_id>/<new_status>", methods=["POST"])
+@role_required(["employee", "admin"])
+def change_po_status(po_id, new_status):
+    allowed_statuses = ['Submitted', 'Canceled']
+    if new_status not in allowed_statuses:
+        flash("Invalid status transition.", "danger")
+        return redirect(url_for('view_purchase_order', po_id=po_id))
+
+    db = get_db()
+    po = db.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    if po:
+        db.execute("UPDATE purchase_orders SET status = ? WHERE id = ?", (new_status, po_id))
+        db.commit()
+        log_audit("CHANGE_PO_STATUS", "purchase_orders", po_id, f"Transitioned {po['po_number']} to {new_status}")
+        flash(f"PO status updated to {new_status}.", "success")
+    return redirect(url_for('view_purchase_order', po_id=po_id))
+
+# --- EP-08: RECEIVING WORKFLOW ---
+@app.route("/purchase_orders/receive/<int:po_id>", methods=["GET", "POST"])
+@role_required(["employee", "admin"])
+def receive_purchase_order(po_id):
+    db = get_db()
+    po = db.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    if not po or po["status"] not in ["Submitted", "Partially Received"]:
+        flash("Only Submitted or Partially Received orders can receive stock.", "warning")
+        return redirect(url_for("purchase_orders"))
+
+    items = db.execute("""
+        SELECT poi.*, b.title, b.identifier, b.on_hand
+        FROM po_items poi
+        JOIN books b ON poi.book_id = b.id
+        WHERE poi.po_id = ?
+    """, (po_id,)).fetchall()
+
+    if request.method == "POST":
+        cursor = db.cursor()
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            any_received = False
+            total_items = len(items)
+            fully_received_items = 0
+
+            for item in items:
+                input_name = f"recv_{item['id']}"
+                qty_incoming = int(request.form.get(input_name, 0))
+
+                remaining = item["quantity_ordered"] - item["quantity_received"]
+                if qty_incoming < 0:
+                    raise ValueError(f"Cannot accept negative quantity for '{item['title']}'.")
+                if qty_incoming > remaining:
+                    raise ValueError(f"Over-receipt prevented: '{item['title']}' only expects {remaining} more copies (attempted {qty_incoming}).")
+
+                if qty_incoming > 0:
+                    any_received = True
+                    # 1. Increment PO item received count
+                    cursor.execute("""
+                        UPDATE po_items SET quantity_received = quantity_received + ? WHERE id = ?
+                    """, (qty_incoming, item["id"]))
+
+                    # 2. Increment physical bookstore on_hand stock
+                    cursor.execute("""
+                        UPDATE books SET on_hand = on_hand + ? WHERE id = ?
+                    """, (qty_incoming, item["book_id"]))
+
+                # Check if item will now be fully received
+                new_total_rec = item["quantity_received"] + qty_incoming
+                if new_total_rec >= item["quantity_ordered"]:
+                    fully_received_items += 1
+
+            if not any_received:
+                flash("No items were checked in. Enter incoming quantities.", "warning")
+                return redirect(url_for("receive_purchase_order", po_id=po_id))
+
+            # Determine updated overall PO status
+            if fully_received_items == total_items:
+                new_po_status = "Received"
+            else:
+                new_po_status = "Partially Received"
+
+            cursor.execute("UPDATE purchase_orders SET status = ? WHERE id = ?", (new_po_status, po_id))
+            db.commit()
+
+            log_audit("RECEIVE_INVENTORY", "purchase_orders", po_id, f"Received shipment for {po['po_number']}. New Status: {new_po_status}")
+            flash(f"Shipment received successfully! Inventory updated. Status: {new_po_status}", "success")
+            return redirect(url_for("view_purchase_order", po_id=po_id))
+
+        except Exception as e:
+            db.rollback()
+            flash(f"Receiving error: {str(e)}", "danger")
+
+    CONTENT = """
+    <div class="row justify-content-center">
+        <div class="col-md-9">
+            <div class="card p-4">
+                <h3 class="fw-bold mb-2">Receive Books into Inventory (EP-08)</h3>
+                <p class="text-muted">Enter incoming shipment quantities. System automatically reconciles on-hand stock and prevents over-receipt.</p>
+                <form method="POST">
+                    <div class="mb-3 p-3 bg-light rounded border">
+                        <strong>Purchase Order:</strong> <code>{{ po.po_number }}</code> |
+                        <strong>Current Status:</strong> <span class="badge bg-primary">{{ po.status }}</span>
+                    </div>
+
+                    <table class="table table-bordered align-middle">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Book Title</th>
+                                <th class="text-center">Ordered</th>
+                                <th class="text-center">Previously Recv</th>
+                                <th class="text-center">Remaining</th>
+                                <th style="width: 160px;" class="text-center bg-warning bg-opacity-25">Now Receiving</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for item in items %}
+                            {% set remaining = item.quantity_ordered - item.quantity_received %}
+                            <tr>
+                                <td><strong>{{ item.title }}</strong><br><small class="text-muted">SKU: {{ item.identifier }}</small></td>
+                                <td class="text-center">{{ item.quantity_ordered }}</td>
+                                <td class="text-center">{{ item.quantity_received }}</td>
+                                <td class="text-center fw-bold">{{ remaining }}</td>
+                                <td>
+                                    {% if remaining > 0 %}
+                                        <input type="number" name="recv_{{ item.id }}" class="form-control text-center" min="0" max="{{ remaining }}" value="{{ remaining }}">
+                                    {% else %}
+                                        <span class="badge bg-success w-100 py-2">Complete</span>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+
+                    <div class="d-flex justify-content-between pt-3">
+                        <a href="{{ url_for('view_purchase_order', po_id=po.id) }}" class="btn btn-secondary">Cancel</a>
+                        <button type="submit" class="btn btn-success fw-bold">Confirm & Reconcile Inventory</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    """
+    return render_page(CONTENT, po=po, items=items)
+
+# --- EP-09: ACCOUNTING & BUSINESS REPORTS ---
+@app.route("/reports")
+@role_required(["employee", "admin"])
+def reports():
+    start_date = request.args.get("start_date", "").strip()
+    end_date = request.args.get("end_date", "").strip()
+
+    db = get_db()
+
+    # 1. Sales metrics (Filtered by date)
+    sales_sql = "SELECT COUNT(*) as txn_count, COALESCE(SUM(subtotal), 0) as gross_subtotal, COALESCE(SUM(tax), 0) as total_tax, COALESCE(SUM(total), 0) as grand_total FROM sales WHERE 1=1"
+    sales_params = []
+    if start_date:
+        sales_sql += " AND date(completed_at) >= date(?)"
+        sales_params.append(start_date)
+    if end_date:
+        sales_sql += " AND date(completed_at) <= date(?)"
+        sales_params.append(end_date)
+
+    sales_summary = db.execute(sales_sql, sales_params).fetchone()
+
+    # 2. Procurement PO Costs (Filtered by date)
+    po_sql = "SELECT COUNT(*) as po_count, COALESCE(SUM(total_cost), 0) as total_po_spend FROM purchase_orders WHERE status != 'Canceled'"
+    po_params = []
+    if start_date:
+        po_sql += " AND date(order_date) >= date(?)"
+        po_params.append(start_date)
+    if end_date:
+        po_sql += " AND date(order_date) <= date(?)"
+        po_params.append(end_date)
+
+    po_summary = db.execute(po_sql, po_params).fetchone()
+
+    # 3. Inventory Valuation (Always reflects current active physical assets)
+    inv_valuation = db.execute("""
+        SELECT COUNT(*) as total_titles,
+               COALESCE(SUM(on_hand), 0) as total_units,
+               COALESCE(SUM(on_hand * price), 0) as total_retail_value
+        FROM books WHERE is_active = 1
+    """).fetchone()
+
+    # 4. Low-Stock Items
+    low_stock_books = db.execute("""
+        SELECT * FROM books WHERE on_hand <= reorder_level AND is_active = 1 ORDER BY on_hand ASC
+    """).fetchall()
+
+    CONTENT = """
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2 class="fw-bold mb-0">Accounting & Operational Reports (EP-09)</h2>
+            <p class="text-muted mb-0">Auditable business metrics reconciling sales, taxes, inventory assets, and procurement spend.</p>
+        </div>
+        <button onclick="window.print()" class="btn btn-outline-dark">Print Report</button>
+    </div>
+
+    <!-- Date Range Filter -->
+    <div class="card p-3 mb-4 bg-white">
+        <form method="GET" action="{{ url_for('reports') }}" class="row g-2 align-items-end">
+            <div class="col-md-4">
+                <label class="form-label small fw-bold">Report Start Date</label>
+                <input type="date" name="start_date" class="form-control" value="{{ start_date }}">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label small fw-bold">Report End Date</label>
+                <input type="date" name="end_date" class="form-control" value="{{ end_date }}">
+            </div>
+            <div class="col-md-2">
+                <button type="submit" class="btn btn-primary w-100">Apply Date Filter</button>
+            </div>
+            <div class="col-md-2">
+                <a href="{{ url_for('reports') }}" class="btn btn-outline-secondary w-100">Reset</a>
+            </div>
+        </form>
+    </div>
+
+    <!-- Summary Metrics Cards -->
+    <div class="row mb-4">
+        <div class="col-md-3">
+            <div class="card p-3 bg-white border-start border-4 border-success">
+                <h6 class="text-muted text-uppercase small">Gross Sales Revenue</h6>
+                <h3 class="fw-bold text-success mb-0">${{ "%.2f"|format(sales_summary.grand_total) }}</h3>
+                <small class="text-muted">{{ sales_summary.txn_count }} completed transactions</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card p-3 bg-white border-start border-4 border-primary">
+                <h6 class="text-muted text-uppercase small">Sales Tax Collected (6.625%)</h6>
+                <h3 class="fw-bold text-primary mb-0">${{ "%.2f"|format(sales_summary.total_tax) }}</h3>
+                <small class="text-muted">Subtotal: ${{ "%.2f"|format(sales_summary.gross_subtotal) }}</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card p-3 bg-white border-start border-4 border-info">
+                <h6 class="text-muted text-uppercase small">Inventory Asset Valuation</h6>
+                <h3 class="fw-bold text-info mb-0">${{ "%.2f"|format(inv_valuation.total_retail_value) }}</h3>
+                <small class="text-muted">{{ inv_valuation.total_units }} units across {{ inv_valuation.total_titles }} titles</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card p-3 bg-white border-start border-4 border-warning">
+                <h6 class="text-muted text-uppercase small">Total Procurement Spend</h6>
+                <h3 class="fw-bold text-warning text-dark mb-0">${{ "%.2f"|format(po_summary.total_po_spend) }}</h3>
+                <small class="text-muted">{{ po_summary.po_count }} active Purchase Orders</small>
+            </div>
+        </div>
+    </div>
+
+    <!-- Low Stock Reorder Alerts -->
+    <div class="card p-3">
+        <h5 class="fw-bold text-danger mb-3">Reorder Alert: Low-Stock Inventory Items</h5>
+        <table class="table table-hover align-middle mb-0">
+            <thead class="table-light">
+                <tr>
+                    <th>SKU</th>
+                    <th>Book Title & Author</th>
+                    <th>Category</th>
+                    <th>Unit Price</th>
+                    <th>Current Stock</th>
+                    <th>Reorder Threshold</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for b in low_stock_books %}
+                <tr class="table-warning">
+                    <td><code>{{ b.identifier }}</code></td>
+                    <td><strong>{{ b.title }}</strong><br><small class="text-muted">{{ b.author }}</small></td>
+                    <td><span class="badge bg-secondary">{{ b.category }}</span></td>
+                    <td>${{ "%.2f"|format(b.price) }}</td>
+                    <td class="fw-bold text-danger">{{ b.on_hand }}</td>
+                    <td>{{ b.reorder_level }}</td>
+                    <td>
+                        <a href="{{ url_for('create_purchase_order') }}" class="btn btn-sm btn-primary">+ Create PO</a>
+                    </td>
+                </tr>
+                {% else %}
+                <tr><td colspan="7" class="text-center py-3 text-muted">All active inventory is above reorder thresholds.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    """
+    return render_page(CONTENT, sales_summary=sales_summary, inv_valuation=inv_valuation,
+                       low_stock_books=low_stock_books, po_summary=po_summary,
+                       start_date=start_date, end_date=end_date)
+
+# --- EP-10: AUDIT LOGS & DATA RECOVERY ---
+@app.route("/audit_logs")
+@role_required(["admin"])
+def audit_logs_view():
+    db = get_db()
+    logs = db.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 100").fetchall()
+    CONTENT = """
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2 class="fw-bold mb-0">System Audit Trail & Security Logs (EP-10)</h2>
+            <p class="text-muted mb-0">Administrator Only: Immutable chronological record of all administrative, financial, and inventory actions.</p>
+        </div>
+    </div>
+    <div class="card p-3">
+        <table class="table table-sm table-hover align-middle mb-0">
+            <thead class="table-light">
+                <tr>
+                    <th>Log ID</th>
+                    <th>Timestamp</th>
+                    <th>Actor (User)</th>
+                    <th>Action</th>
+                    <th>Entity</th>
+                    <th>Record ID</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for l in logs %}
+                <tr>
+                    <td><code>#{{ l.id }}</code></td>
+                    <td><small>{{ l.created_at }}</small></td>
+                    <td><small>{{ l.user_email }}</small></td>
+                    <td><span class="badge bg-secondary">{{ l.action }}</span></td>
+                    <td><code>{{ l.entity }}</code></td>
+                    <td>{{ l.entity_id or '-' }}</td>
+                    <td><small>{{ l.details or '' }}</small></td>
+                </tr>
+                {% else %}
+                <tr><td colspan="7" class="text-center py-4 text-muted">No audit events recorded yet.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    """
+    return render_page(CONTENT, logs=logs)
+
+# --- SERVER STARTUP ---
+init_db()
+print("==================================================================", flush=True)
+print("Database initialized successfully with Sprint 1 & Sprint 2 schemas.", flush=True)
+print("Bookstore Management System (Sprint 2) is LIVE on: http://127.0.0.1:5050", flush=True)
+print("==================================================================", flush=True)
+try:
+    webbrowser.open("http://127.0.0.1:5050")
+except Exception:
+    pass
+
 if __name__ == "__main__":
-    init_db()
-    print("==================================================================")
-    print("Database initialized successfully.")
-    print("Bookstore Management System is LIVE on: http://127.0.0.1:5000")
-    print("==================================================================")
-    try:
-        webbrowser.open("http://127.0.0.1:5000")
-    except Exception:
-        pass
-    app.run(debug=False, host="127.0.0.1", port=5000)
+    app.run(host="127.0.0.1", port=5050, debug=False)
